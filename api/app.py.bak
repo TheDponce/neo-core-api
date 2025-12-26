@@ -1,0 +1,209 @@
+import os
+import json
+import time
+import uuid
+from typing import Optional, Any, Dict, List
+
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+
+load_dotenv()
+
+app = FastAPI(title="Neo-Core Swarm API", version="0.1.0")
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://neo-core-4ec9701b.base44.app",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount the real API (routes) under the same root
+app.mount("", core_app)
+
+# ---------- Models ----------
+class SwarmRequest(BaseModel):
+    question: str
+    thread_id: Optional[str] = None
+
+class AdvisorOut(BaseModel):
+    name: str
+    model: str
+    summary: str
+    risks: List[str]
+    recommendation: str
+
+class MonarchOut(BaseModel):
+    decision: str
+    rationale: str
+    dissent_summary: str
+    next_actions: List[str]
+
+class SwarmResponse(BaseModel):
+    status: str
+    request_id: str
+    thread_id: Optional[str]
+    timing_ms: int
+    advisors: List[AdvisorOut]
+    monarch: MonarchOut
+
+# ---------- Auth ----------
+def require_api_key(x_api_key: Optional[str]):
+    expected = os.getenv("NEOCORE_API_KEY")
+    if not expected:
+        raise HTTPException(status_code=500, detail="Server misconfigured: missing NEOCORE_API_KEY")
+    if not x_api_key or x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ---------- Azure OpenAI (REST) ----------
+AZ_ENDPOINT = os.getenv("AZURE_AOAI_ENDPOINT", "").rstrip("/")
+AZ_KEY = os.getenv("AZURE_AOAI_API_KEY", "")
+AZ_VER = os.getenv("AZURE_AOAI_API_VERSION", "")
+
+def aoai_chat(deployment: str, messages: List[Dict[str, str]], max_completion_tokens: int = 400) -> str:
+    if not (AZ_ENDPOINT and AZ_KEY and AZ_VER):
+        raise RuntimeError("Missing AZURE_AOAI_ENDPOINT / AZURE_AOAI_API_KEY / AZURE_AOAI_API_VERSION")
+
+    url = f"{AZ_ENDPOINT}/openai/deployments/{deployment}/chat/completions"
+    params = {"api-version": AZ_VER}
+    headers = {"api-key": AZ_KEY, "Content-Type": "application/json"}
+    payload = {
+        "messages": messages,
+        "max_completion_tokens": max_completion_tokens
+    }
+
+    r = requests.post(url, params=params, headers=headers, json=payload, timeout=60)
+    if r.status_code >= 400:
+        # pass through Azure error body
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+
+    data = r.json()
+    return (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
+
+def safe_json(text: str) -> Dict[str, Any]:
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
+
+# ---------- Personalities ----------
+def advisor_prompt(name: str, style: str, question: str) -> List[Dict[str, str]]:
+    system = (
+        f"You are {name}. {style}\n"
+        "Return STRICT JSON only (no markdown) with keys: summary (string), risks (array of strings), recommendation (string).\n"
+        "Be concise and specific.\n"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": question},
+    ]
+
+def monarch_prompt(question: str, advisors: List[AdvisorOut]) -> List[Dict[str, str]]:
+    advisors_compact = [
+        {"name": a.name, "model": a.model, "summary": a.summary, "risks": a.risks, "recommendation": a.recommendation}
+        for a in advisors
+    ]
+    system = (
+        "You are Aristotle-Monarch, the final decision-maker.\n"
+        "You receive multiple advisor opinions. Synthesize them into a clear decision.\n"
+        "Return STRICT JSON only (no markdown) with keys:\n"
+        "decision (string), rationale (string), dissent_summary (string), next_actions (array of strings).\n"
+        "Decision MUST directly address the user's question.\n"
+    )
+    user = {
+        "question": question,
+        "advisors": advisors_compact
+    }
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ]
+
+# ---------- Routes ----------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/swarm/decide", response_model=SwarmResponse)
+def swarm_decide(payload: SwarmRequest, x_api_key: Optional[str] = Header(default=None)) -> SwarmResponse:
+    require_api_key(x_api_key)
+
+    start = time.time()
+    request_id = str(uuid.uuid4())
+
+    # deployments (these are your Azure DEPLOYMENT NAMES, not model IDs)
+    dep_builder = os.getenv("AZURE_AOAI_MODEL_BUILDER", "gpt-4.1-mini")
+    dep_skeptic = os.getenv("AZURE_AOAI_MODEL_SKEPTIC", "gpt-4.1-mini")
+    dep_optimizer = os.getenv("AZURE_AOAI_MODEL_OPTIMIZER", "gpt-4.1-mini")
+    dep_user = os.getenv("AZURE_AOAI_MODEL_USER", "gpt-4.1")
+    dep_monarch = os.getenv("AZURE_AOAI_MODEL_MONARCH", "o4-mini")
+
+    # advisors
+    advisor_defs = [
+        ("Builder", dep_builder, "Your lens: ship fast, pragmatic MVP, bias to action."),
+        ("Skeptic", dep_skeptic, "Your lens: security, failure modes, compliance, what can go wrong."),
+        ("Optimizer", dep_optimizer, "Your lens: cost, latency, architecture efficiency, operational simplicity."),
+        ("UserAdvocate", dep_user, "Your lens: UX clarity, trust, user value, friction reduction."),
+    ]
+
+    advisors: List[AdvisorOut] = []
+    for (name, dep, style) in advisor_defs:
+        raw = aoai_chat(dep, advisor_prompt(name, style, payload.question), max_completion_tokens=500)
+        obj = safe_json(raw)
+
+        # Fallback if model didn't return JSON
+        summary = (obj.get("summary") or "").strip()
+        risks = obj.get("risks") if isinstance(obj.get("risks"), list) else []
+        recommendation = (obj.get("recommendation") or "").strip()
+
+        if not summary and raw.strip():
+            summary = raw.strip()
+            risks = []
+            recommendation = "N/A"
+
+        advisors.append(AdvisorOut(
+            name=name,
+            model=dep,
+            summary=summary or "",
+            risks=[str(x) for x in risks],
+            recommendation=recommendation or ""
+        ))
+
+    # monarch
+    raw_m = aoai_chat(dep_monarch, monarch_prompt(payload.question, advisors), max_completion_tokens=600)
+    obj_m = safe_json(raw_m)
+
+    decision = (obj_m.get("decision") or "").strip()
+    rationale = (obj_m.get("rationale") or "").strip()
+    dissent_summary = (obj_m.get("dissent_summary") or "").strip()
+    next_actions = obj_m.get("next_actions") if isinstance(obj_m.get("next_actions"), list) else []
+
+    # hard fallback if monarch didn't return JSON
+    if not decision and raw_m.strip():
+        decision = raw_m.strip()
+        rationale = ""
+        dissent_summary = ""
+        next_actions = []
+
+    ms = int((time.time() - start) * 1000)
+
+    return SwarmResponse(
+        status="ok",
+        request_id=request_id,
+        thread_id=payload.thread_id,
+        timing_ms=ms,
+        advisors=advisors,
+        monarch=MonarchOut(
+            decision=decision,
+            rationale=rationale,
+            dissent_summary=dissent_summary,
+            next_actions=[str(x) for x in next_actions],
+        )
+    )
