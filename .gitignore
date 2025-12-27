@@ -20,3 +20,19 @@ __pycache__/
 
 # mac
 .DS_Store
+
+# --- secrets / local env ---
+.env
+.env.*
+!.env.example
+*.bak
+*.pem
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# mac
+.DS_Store
