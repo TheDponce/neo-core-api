@@ -4,3 +4,19 @@ __pycache__/
 .env
 .DS_Store
 .env*
+
+# --- secrets / local env ---
+.env
+.env.*
+!.env.example
+*.bak
+*.pem
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# mac
+.DS_Store

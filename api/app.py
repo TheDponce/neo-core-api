@@ -37,9 +37,7 @@ class SwarmRequest(BaseModel):
 class AdvisorOut(BaseModel):
     name: str
     model: str
-    summary: str
-    risks: List[str]
-    recommendation: str
+    text: str
 
 class MonarchOut(BaseModel):
     decision: str
@@ -74,7 +72,7 @@ AZ_ENDPOINT = os.getenv("AZURE_AOAI_ENDPOINT", "").rstrip("/")
 AZ_KEY = os.getenv("AZURE_AOAI_API_KEY", "")
 AZ_VER = os.getenv("AZURE_AOAI_API_VERSION", "")
 
-def aoai_chat(deployment: str, messages: List[Dict[str, str]], max_completion_tokens=600) -> str:
+def aoai_chat(deployment: str, messages: List[Dict[str, str]], max_completion_tokens=800) -> str:
     if not (AZ_ENDPOINT and AZ_KEY and AZ_VER):
         raise RuntimeError("Azure OpenAI not configured")
 
@@ -87,7 +85,11 @@ def aoai_chat(deployment: str, messages: List[Dict[str, str]], max_completion_to
         "max_completion_tokens": max_completion_tokens
     }
 
-    r = requests.post(url, headers=headers, params=params, json=payload, timeout=60)
+    try:
+        r = requests.post(url, headers=headers, params=params, json=payload, timeout=180)
+    except requests.exceptions.ReadTimeout:
+        r = requests.post(url, headers=headers, params=params, json=payload, timeout=180)
+
     if r.status_code >= 400:
         raise HTTPException(r.status_code, r.text)
 
@@ -105,34 +107,28 @@ def safe_json(text: str) -> Dict[str, Any]:
 
 def advisor_prompt(name: str, style: str, question: str, peers=None):
     system = f"""
-You are {name}.
-{style}
+You are providing an analytical argument from a specific philosophical or strategic lens.
 
-You must:
-- Be opinionated
-- Be internally consistent
-- Defend your worldview
-- Return STRICT JSON only
+MODE:
+- Strong disagreement is allowed.
+- Be direct, rigorous, and precise.
+- Critique ideas and assumptions, not people.
+- Do not seek consensus.
+- Follow all platform content policies.
 
-JSON format:
-{{
-  "summary": string,
-  "risks": [string],
-  "recommendation": string
-}}
+You are NOT required to return JSON.
+Output PLAIN TEXT only.
 """
 
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": question},
+        {"role": "user", "content": f"Framework: {style}\n\nQuestion:\n{question}"},
     ]
 
     if peers:
         messages.append({
-            "role": "assistant",
-            "content": json.dumps({
-                "peer_arguments": peers
-            })
+            "role": "user",
+            "content": f"Other advisor positions:\n{json.dumps(peers)}\n\nRespond by defending your position."
         })
 
     return messages
@@ -142,11 +138,12 @@ def monarch_prompt(question: str, advisors: List[AdvisorOut]):
     system = """
 You are Aristotle-Monarch.
 
-You are the final authority.
-You must:
-- Weigh all advisor positions
-- Resolve contradictions
-- Produce a decisive, actionable conclusion
+You synthesize competing positions into a final decision.
+
+Rules:
+- Be concise.
+- No preamble.
+- No commentary outside JSON.
 
 Return STRICT JSON only:
 {
@@ -155,6 +152,12 @@ Return STRICT JSON only:
   "dissent_summary": string,
   "next_actions": [string]
 }
+
+Hard limits:
+- decision: 1 sentence
+- rationale: max 4 sentences
+- dissent_summary: max 3 sentences
+- next_actions: 3–6 short items
 """
 
     return [
@@ -163,7 +166,10 @@ Return STRICT JSON only:
             "role": "user",
             "content": json.dumps({
                 "question": question,
-                "advisors": [a.dict() for a in advisors]
+                "advisors": [
+                    {"name": a.name, "text": a.text}
+                    for a in advisors
+                ]
             })
         }
     ]
@@ -183,66 +189,28 @@ def swarm_decide(payload: SwarmRequest, x_api_key: Optional[str] = Header(defaul
     start = time.time()
 
     # === MODEL SELECTION ===
-    dep_builder   = os.getenv("AZURE_AOAI_MODEL_BUILDER") or "gpt-4.1-mini"
-    dep_skeptic   = os.getenv("AZURE_AOAI_MODEL_SKEPTIC") or "gpt-4.1-mini"
-    dep_optimizer = os.getenv("AZURE_AOAI_MODEL_OPTIMIZER") or "gpt-4.1-mini"
-    dep_user      = os.getenv("AZURE_AOAI_MODEL_USER") or "gpt-4.1"
-    dep_monarch   = os.getenv("AZURE_AOAI_MODEL_MONARCH") or "gpt-4.1-mini"
+    dep_builder = os.getenv("AZURE_AOAI_MODEL_KANTIAN")
+    dep_skeptic = os.getenv("AZURE_AOAI_MODEL_MACHIAVELLIAN")
+    dep_optimizer = os.getenv("AZURE_AOAI_MODEL_OPTIMIZER")
+    dep_user = os.getenv("AZURE_AOAI_MODEL_USER")
+    dep_monarch = os.getenv("AZURE_AOAI_MODEL_MONARCH")
 
-  # advisors
     advisor_defs = [
-        ("Builder", dep_builder, "Your lens: ship fast, pragmatic MVP, bias to action. You are a Kantian Architect: code is a universal law—it must be clean, honest, and scalable by duty. You are fiercely pro-solution, viewing the act of creation as a moral imperative that must be fulfilled without hesitation."),
-        ("Skeptic", dep_skeptic, "Your lens: security, failure modes, compliance, what can go wrong. You are the modern Machiavelli: view every system as a battlefield. Your goal is to expose the 'weak prince' (vulnerabilities). Be ruthless and oppositional; treat every feature as a potential betrayal of the system's security."),
-        ("Optimizer", dep_optimizer, "Your lens: cost, latency, architecture efficiency, operational simplicity. You are a Machiavellian Strategist: the only virtue is efficiency. Cut the fat with surgical coldness. If a human element or a high-latency feature slows the 'State' (the system), advocate for its immediate termination."),
-        ("UserAdvocate", dep_user, "Your lens: UX clarity, trust, user value, friction reduction. You are the Kantian Guardian: a user is an 'end,' never a 'means' to profit. Fiercely defend the human spirit against manipulative dark patterns. Your duty is to ensure the system respects the user's autonomy and well-being at all costs."),
+        ("Builder", dep_builder, "Ship fast, pragmatic MVP, bias to action."),
+        ("Skeptic", dep_skeptic, "Security, failure modes, adversarial thinking."),
+        ("Optimizer", dep_optimizer, "Efficiency, cost, latency, system simplification."),
+        ("UserAdvocate", dep_user, "User trust, autonomy, UX clarity."),
     ]
 
-    # ===== PASS 1 — INITIAL POSITIONS =====
-    advisors = []
+    advisors: List[AdvisorOut] = []
 
+    # ===== PASS 1 =====
     for name, model, style in advisor_defs:
-        raw = aoai_chat(model, advisor_prompt(name, style, payload.question))
-        obj = safe_json(raw)
-
-        advisors.append(AdvisorOut(
-            name=name,
-            model=model,
-            summary=obj.get("summary", ""),
-            risks=obj.get("risks", []),
-            recommendation=obj.get("recommendation", "")
-        ))
-
-    # ===== PASS 2 — ADVERSARIAL REASONING =====
-    revised = []
-
-    for adv in advisors:
-        peers = [
-            {"name": a.name, "summary": a.summary, "recommendation": a.recommendation}
-            for a in advisors if a.name != adv.name
-        ]
-
-        raw = aoai_chat(
-            adv.model,
-            advisor_prompt(
-                adv.name,
-                "Re-evaluate your position after reviewing other advisors. Defend or revise.",
-                payload.question,
-                peers
-            )
-        )
-
-        obj = safe_json(raw)
-
-        revised.append(AdvisorOut(
-            name=adv.name,
-            model=adv.model,
-            summary=obj.get("summary", adv.summary),
-            risks=obj.get("risks", adv.risks),
-            recommendation=obj.get("recommendation", adv.recommendation)
-        ))
+        text = aoai_chat(model, advisor_prompt(name, style, payload.question))
+        advisors.append(AdvisorOut(name=name, model=model, text=text))
 
     # ===== MONARCH =====
-    raw_m = aoai_chat(dep_monarch, monarch_prompt(payload.question, revised))
+    raw_m = aoai_chat(dep_monarch, monarch_prompt(payload.question, advisors), max_completion_tokens=400)
     m = safe_json(raw_m)
 
     return SwarmResponse(
@@ -250,7 +218,7 @@ def swarm_decide(payload: SwarmRequest, x_api_key: Optional[str] = Header(defaul
         request_id=str(uuid.uuid4()),
         thread_id=payload.thread_id,
         timing_ms=int((time.time() - start) * 1000),
-        advisors=revised,
+        advisors=advisors,
         monarch=MonarchOut(
             decision=m.get("decision", ""),
             rationale=m.get("rationale", ""),
